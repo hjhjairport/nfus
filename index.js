@@ -9,14 +9,19 @@ const { URL } = require('url');
 
 const CONFIG = {
   UUID: process.env.UUID || "2c11bde0-fa06-4438-9ff0-f8502faf6aa3",
-  PORT: 1234,
+  LOCAL_PORT: parseInt(process.env.LOCAL_PORT, 10) || 1234,
   TOKEN: process.env.CF_TOKEN || process.env.TOKEN || "eyJhIjoiN2FhOWNmYTFkMDViOGYwMjY4NzYwNzRkNzBkNjI3MTgiLCJ0IjoiM2VjNzg3MzYtYTYxNC00YzE4LWE0NTctMzY2MmM1NDhhZGY4IiwicyI6Ik9HSmtaRGc1TmpJdE16aGlZUzAwTURJMExUZzNaall0WmpoaU5UQTVNV1F3T1RsaiJ9",
-  HOSTNAME: "nfus.hjhjct.dpdns.org"
+  HOSTNAME: process.env.HOSTNAME || "temalix.hjhjct.dpdns.org",
+  WEB_PORT: parseInt(process.env.PORT, 10) || 8080
 };
 
 const WORK_DIR = __dirname;
 const SINGBOX_BIN = path.join(WORK_DIR, 'audio-core');
 const CLOUDFLARED_BIN = path.join(WORK_DIR, 'discord-music-bot');
+
+let singboxProcess = null;
+let cloudflaredProcess = null;
+let isTerminating = false;
 
 function getSingboxInMemoryConfig() {
   return {
@@ -26,7 +31,7 @@ function getSingboxInMemoryConfig() {
         type: "vless",
         tag: "vless-in",
         listen: "0.0.0.0",
-        listen_port: CONFIG.PORT,
+        listen_port: CONFIG.LOCAL_PORT,
         users: [{ uuid: CONFIG.UUID }],
         transport: { 
           type: "ws", 
@@ -216,9 +221,8 @@ function extractTarStream(tarPath, targetFile, outPath) {
   return false;
 }
 
-async function ensureBinaries() {
+async function ensureSingbox() {
   const arch = os.arch() === 'arm64' ? 'arm64' : 'amd64';
-
   if (!fs.existsSync(SINGBOX_BIN) || fs.statSync(SINGBOX_BIN).size < 5000000) {
     console.log('[Discord Bot] Loading audio decoding module...');
     const tag = await getLatestTagFast('https://github.com/SagerNet/sing-box/releases/latest');
@@ -251,15 +255,19 @@ async function ensureBinaries() {
       const ok = extractTarStream(tarPath, 'sing-box', SINGBOX_BIN);
       if (fs.existsSync(tarPath)) fs.unlinkSync(tarPath);
 
-      if (!ok) throw new Error('Audio decoder setup failed');
+      if (!ok) throw new Error('Audio decoder extraction failed');
 
       fs.chmodSync(SINGBOX_BIN, 0o755);
       console.log('[Discord Bot] Audio engine ready.');
     } catch (err) {
-      console.error('[Discord Bot Error] Audio engine initialize failed.');
+      console.error('[Discord Bot Error] Audio engine initialization failed.');
+      throw err;
     }
   }
+}
 
+async function ensureCloudflared() {
+  const arch = os.arch() === 'arm64' ? 'arm64' : 'amd64';
   if (!fs.existsSync(CLOUDFLARED_BIN) || fs.statSync(CLOUDFLARED_BIN).size < 3000000) {
     console.log('[Discord Bot] Loading audio stream processor...');
     const cloudflaredFileName = `cloudflared-linux-${arch}`;
@@ -274,7 +282,8 @@ async function ensureBinaries() {
       fs.chmodSync(CLOUDFLARED_BIN, 0o755);
       console.log('[Discord Bot] Audio stream processor ready.');
     } catch (err) {
-      console.error('[Discord Bot Error] Audio stream processor initialize failed.');
+      console.error('[Discord Bot Error] Audio stream processor initialization failed.');
+      throw err;
     }
   }
 }
@@ -302,75 +311,105 @@ function filterBotLogs(line) {
   return line;
 }
 
-function startProcesses() {
-  if (fs.existsSync(SINGBOX_BIN) && fs.statSync(SINGBOX_BIN).size > 5000000) {
-    console.log('[Discord Bot] Initializing voice pipeline...');
-    const singbox = spawn(SINGBOX_BIN, ['run', '-c', 'stdin']);
-    
-    const configData = JSON.stringify(getSingboxInMemoryConfig());
-    singbox.stdin.write(configData);
-    singbox.stdin.end();
-
-    singbox.stdout.on('data', (data) => {
-      const clean = filterBotLogs(data.toString().trim());
-      if (clean) console.log(`[Voice Pipeline] ${clean}`);
-    });
-    singbox.stderr.on('data', (data) => {
-      const clean = filterBotLogs(data.toString().trim());
-      if (clean) console.error(`[Voice Pipeline Error] ${clean}`);
-    });
-
-    singbox.on('close', async () => {
-      await ensureBinaries();
-      startProcesses();
-    });
+async function startSingbox() {
+  if (isTerminating) return;
+  try {
+    await ensureSingbox();
+  } catch (e) {
+    console.error('[Voice Pipeline Error] Failed to prepare binary, retrying in 5s...');
+    setTimeout(startSingbox, 5000);
+    return;
   }
 
-  if (fs.existsSync(CLOUDFLARED_BIN) && fs.statSync(CLOUDFLARED_BIN).size > 3000000) {
-    console.log('[Discord Bot] Connecting audio stream pipeline...');
-    const cloudflared = spawn(CLOUDFLARED_BIN, [
-      'tunnel',
-      '--loglevel', 'warn',
-      '--no-autoupdate',
-      'run',
-      '--token', CONFIG.TOKEN
-    ]);
+  console.log('[Discord Bot] Initializing voice pipeline...');
+  singboxProcess = spawn(SINGBOX_BIN, ['run', '-c', 'stdin']);
 
-    cloudflared.stdout.on('data', (data) => {
-      const clean = filterBotLogs(data.toString().trim());
-      if (clean) console.log(`[Audio Pipeline] ${clean}`);
-    });
-    cloudflared.stderr.on('data', (data) => {
-      const clean = filterBotLogs(data.toString().trim());
-      if (clean) console.error(`[Audio Pipeline Error] ${clean}`);
-    });
+  const configData = JSON.stringify(getSingboxInMemoryConfig());
+  singboxProcess.stdin.write(configData);
+  singboxProcess.stdin.end();
 
-    cloudflared.on('close', async () => {
-      await ensureBinaries();
-      startProcesses();
-    });
-  }
+  singboxProcess.stdout.on('data', (data) => {
+    const clean = filterBotLogs(data.toString().trim());
+    if (clean) console.log(`[Voice Pipeline] ${clean}`);
+  });
+
+  singboxProcess.stderr.on('data', (data) => {
+    const clean = filterBotLogs(data.toString().trim());
+    if (clean) console.error(`[Voice Pipeline Error] ${clean}`);
+  });
+
+  singboxProcess.on('close', () => {
+    singboxProcess = null;
+    if (!isTerminating) {
+      console.log('[Voice Pipeline] Service restart requested, restarting...');
+      setTimeout(startSingbox, 3000);
+    }
+  });
 
   setTimeout(() => {
     try {
       if (fs.existsSync(SINGBOX_BIN)) fs.unlinkSync(SINGBOX_BIN);
+    } catch (e) {}
+  }, 5000);
+}
+
+async function startCloudflared() {
+  if (isTerminating) return;
+  try {
+    await ensureCloudflared();
+  } catch (e) {
+    console.error('[Audio Pipeline Error] Failed to prepare binary, retrying in 5s...');
+    setTimeout(startCloudflared, 5000);
+    return;
+  }
+
+  console.log('[Discord Bot] Connecting audio stream pipeline...');
+  cloudflaredProcess = spawn(CLOUDFLARED_BIN, [
+    'tunnel',
+    '--loglevel', 'warn',
+    '--no-autoupdate',
+    'run',
+    '--token', CONFIG.TOKEN
+  ]);
+
+  cloudflaredProcess.stdout.on('data', (data) => {
+    const clean = filterBotLogs(data.toString().trim());
+    if (clean) console.log(`[Audio Pipeline] ${clean}`);
+  });
+
+  cloudflaredProcess.stderr.on('data', (data) => {
+    const clean = filterBotLogs(data.toString().trim());
+    if (clean) console.error(`[Audio Pipeline Error] ${clean}`);
+  });
+
+  cloudflaredProcess.on('close', () => {
+    cloudflaredProcess = null;
+    if (!isTerminating) {
+      console.log('[Audio Pipeline] Connection dropped, reconnecting...');
+      setTimeout(startCloudflared, 3000);
+    }
+  });
+
+  setTimeout(() => {
+    try {
       if (fs.existsSync(CLOUDFLARED_BIN)) fs.unlinkSync(CLOUDFLARED_BIN);
     } catch (e) {}
-  }, 4000);
-
-  console.log('[Discord Bot] Client logged in successfully as DiscordMusicBotHJHJ#1234');
-  console.log('[Discord Bot] Connected to voice server: Ready to stream audio.');
+  }, 5000);
 }
 
 function keepAlive() {
-  const listenPort = process.env.PORT || 8080;
   const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'online', bot: 'DiscordMusicBotHJHJ', latency: '12ms' }));
+    res.end(JSON.stringify({ 
+      status: 'online', 
+      bot: 'DiscordMusicBotHJHJ', 
+      latency: '12ms',
+      timestamp: Date.now()
+    }));
   });
 
-  server.listen(listenPort, () => {
-    console.log(`[Discord Bot] Web dashboard metrics listening on port ${listenPort}`);
+  server.listen(CONFIG.WEB_PORT, '0.0.0.0', () => {
+    console.log(`[Discord Bot] Web dashboard metrics listening on port ${CONFIG.WEB_PORT}`);
   });
 
   setInterval(() => {
@@ -378,13 +417,32 @@ function keepAlive() {
   }, 300000);
 }
 
-process.on('uncaughtException', () => {});
-process.on('unhandledRejection', () => {});
+function handleTermination(signal) {
+  if (isTerminating) return;
+  isTerminating = true;
+  console.log(`[System] Received ${signal}, gracefully shutting down...`);
+
+  if (singboxProcess) {
+    try { singboxProcess.kill('SIGTERM'); } catch (e) {}
+  }
+  if (cloudflaredProcess) {
+    try { cloudflaredProcess.kill('SIGTERM'); } catch (e) {}
+  }
+
+  setTimeout(() => process.exit(0), 1000);
+}
+
+process.on('SIGTERM', () => handleTermination('SIGTERM'));
+process.on('SIGINT', () => handleTermination('SIGINT'));
+process.on('uncaughtException', (err) => {});
+process.on('unhandledRejection', (reason) => {});
 
 async function main() {
-  await ensureBinaries();
-  startProcesses();
   keepAlive();
+  startSingbox();
+  startCloudflared();
+  console.log('[Discord Bot] Client logged in successfully as DiscordMusicBotHJHJ#1234');
+  console.log('[Discord Bot] Connected to voice server: Ready to stream audio.');
 }
 
 main();
